@@ -1,0 +1,85 @@
+# Сборка VN Safe для Linux (64 бита): VNSafe-<версия>.deb (Ubuntu, Debian, Mint и похожие) и
+# VNSafe-<версия>.AppImage (любой дистрибутив, без установки). Ядра Mihomo/Xray внутри.
+# Пакет .deb даёт ядру Mihomo право управлять сетью, поэтому режим «Весь трафик» работает без root.
+# Запуск: Actions → «Linux» → Run workflow, или как часть «Выпуск версии».
+name: Linux
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+env:
+  TAURI_CLI_VERSION: "2.12.3"   # та же версия, что на Windows и Mac
+
+jobs:
+  linux:
+    # the oldest supported Ubuntu: a program built here also starts on newer systems
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - name: Системные библиотеки
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libssl-dev libgtk-3-dev patchelf file
+
+      - name: Кэш Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            src-tauri/target
+          key: linux-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: linux-
+
+      - name: Tauri CLI
+        run: cargo tauri --version 2>/dev/null | grep -q "$TAURI_CLI_VERSION" || cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core-lib/go.mod
+          cache-dependency-path: core-lib/go.sum
+
+      - name: Версия, иконки, ядра
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/set-version.sh
+          cargo tauri icon src-tauri/icons/source-desktop.png
+          ./scripts/fetch-cores-linux.sh
+          ./scripts/build-core-lib.sh src-tauri/cores-linux
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Проверка кода
+        run: |
+          node --check ui/app.js
+          cd src-tauri && cargo test --lib -- --skip net_speed
+
+      - name: Сборка
+        run: cargo tauri build --bundles deb,appimage
+
+      - name: Собрать файлы
+        run: |
+          ver="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/')"
+          deb="$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)"
+          img="$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -1)"
+          [ -n "$deb" ] || { echo "Файл .deb не найден"; exit 1; }
+          mkdir -p dist && cp "$deb" "dist/VNSafe-$ver-linux.deb"
+          [ -n "$img" ] && cp "$img" "dist/VNSafe-$ver-linux.AppImage"
+          # the engines inside the package must be runnable programs
+          dpkg-deb -c "dist/VNSafe-$ver-linux.deb" | grep -E 'cores/(mihomo|xray|libvncore\.so)$'
+          echo "VER=$ver" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VNSafe-${{ env.VER }}-Linux
+          path: dist/*
+          retention-days: 14

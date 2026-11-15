@@ -1,0 +1,167 @@
+# Windows and Android builds on GitHub's machines: the laptop does not need to be on.
+# Run: Actions → «Windows и Android» → Run workflow. The files are under Artifacts on the run's page.
+#   VNSafe-Setup-<версия>.exe   one installer for 32- and 64-bit Windows
+#   VNSafe-<версия>.apk / .aab  Android, signed with your key (repository secrets, see docs/CLOUD-BUILD.md)
+name: Windows и Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: "Windows"
+        type: boolean
+        default: true
+      android:
+        description: "Android"
+        type: boolean
+        default: true
+  # «Выпуск версии» (release.yml) запускает эту сборку как часть общей
+  workflow_call:
+    inputs:
+      windows:
+        type: boolean
+        default: true
+      android:
+        type: boolean
+        default: true
+
+env:
+  TAURI_CLI_VERSION: "2.12.3"
+
+jobs:
+  windows:
+    if: ${{ inputs.windows }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - name: Кэш Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            src-tauri/target
+            src-tauri/cores-cache
+          key: win-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: win-
+
+      - name: Tauri CLI
+        run: |
+          rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
+          $v = (cargo tauri --version 2>$null)
+          if ("$v" -notmatch [regex]::Escape($env:TAURI_CLI_VERSION)) { cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked }
+
+      # Mihomo inside the app (vncore.dll, scripts/build-core-lib.ps1): Go here, gcc comes with the Windows runner
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core-lib/go.mod
+          cache-dependency-path: core-lib/go.sum
+
+      - name: Сборка
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/build-universal.ps1
+
+      - name: Файл
+        run: |
+          $f = Get-ChildItem dist -Filter 'VNSafe-Setup-*.exe' | Select-Object -First 1
+          if (-not $f) { throw 'Установщик не найден' }
+          "NAME=$($f.BaseName)" | Out-File $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-Windows
+          path: dist/VNSafe-Setup-*.exe
+          retention-days: 14
+
+  android:
+    if: ${{ inputs.android }}
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Кэш Rust и ядер
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            src-tauri/target
+            src-tauri/cores-cache
+            vendor/android
+          key: android-${{ hashFiles('src-tauri/Cargo.lock', 'core-lib/go.sum') }}
+          restore-keys: android-
+
+      # the engines inside the app (core-lib → libvncore.so for each phone processor, built with the NDK)
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core-lib/go.mod
+          cache-dependency-path: core-lib/go.sum
+
+      - name: Android SDK, NDK, Rust
+        run: |
+          "NDK_HOME=$env:ANDROID_NDK_LATEST_HOME" | Out-File $env:GITHUB_ENV -Append
+          "ANDROID_HOME=$env:ANDROID_SDK_ROOT" | Out-File $env:GITHUB_ENV -Append
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          $v = (cargo tauri --version 2>$null)
+          if ("$v" -notmatch [regex]::Escape($env:TAURI_CLI_VERSION)) { cargo install tauri-cli --version $env:TAURI_CLI_VERSION --locked }
+
+      # The signing key comes from the repository secrets (the same key as on the laptop: updates keep working)
+      - name: Ключ подписи
+        env:
+          JKS: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if (-not $env:JKS -or -not $env:PW) { throw 'Нет секретов ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD: см. docs/CLOUD-BUILD.md' }
+          New-Item -ItemType Directory -Force keystore | Out-Null
+          [IO.File]::WriteAllBytes("$PWD/keystore/vnsafe.jks", [Convert]::FromBase64String($env:JKS))
+          @("storeFile=$PWD\keystore\vnsafe.jks", "storePassword=$env:PW", "keyAlias=vnsafe", "keyPassword=$env:PW") | Set-Content keystore/keystore.properties
+
+      - name: Проект Android и значок
+        run: |
+          ./scripts/set-version.ps1
+          cargo tauri android init --ci
+          cargo tauri icon ui/assets/logo.png
+
+      - name: Сборка
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/build-android.ps1
+
+      - name: Файл
+        run: |
+          $f = Get-ChildItem dist -Filter 'VNSafe-*.apk' | Select-Object -First 1
+          if (-not $f) { throw 'APK не найден' }
+          "NAME=$($f.BaseName)" | Out-File $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-Android
+          path: |
+            dist/VNSafe-*.apk
+            dist/VNSafe-*.aab
+          retention-days: 14

@@ -1,0 +1,214 @@
+# Сборка VN Safe для iPhone (и по желанию для Mac) на Mac-машине GitHub со свежим Xcode.
+# Запуск: вкладка Actions → «iPhone и Mac» → Run workflow. Готовые файлы — внизу страницы запуска, в разделе Artifacts.
+#   VNSafe-<версия>.ipa      без подписи: ставится через Sideloadly / AltStore (они подписывают вашим Apple ID);
+#                            собственный VPN в такой сборке не работает, подключение через Happ / Hiddify
+#   С аккаунтом Apple Developer (секреты репозитория, см. docs/IPHONE-VPN.md) и галочкой «testflight»:
+#   подписанная сборка со своим VPN уходит в TestFlight, ставится на iPhone из приложения TestFlight.
+#   VNSafe-<версия>-mac.dmg  для Mac с процессором Intel (MacBook Air 2014 и т. п.), только если отмечено «mac»
+name: iPhone и Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      ios:
+        description: "Собрать iPhone"
+        type: boolean
+        default: true
+      mac:
+        description: "Собрать ещё и версию для Mac (Intel)"
+        type: boolean
+        default: false
+      testflight:
+        description: "Подписать и отправить в TestFlight (нужен аккаунт Apple Developer и секреты)"
+        type: boolean
+        default: false
+  # «Выпуск версии» (release.yml) запускает эту сборку как часть общей
+  workflow_call:
+    inputs:
+      ios:
+        type: boolean
+        default: true
+      mac:
+        type: boolean
+        default: true
+      testflight:
+        type: boolean
+        default: false
+
+env:
+  TAURI_CLI_VERSION: "2.12.3"   # та же версия, что на Windows
+
+jobs:
+  ios:
+    if: ${{ inputs.ios }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      # The newest Xcode on the machine (26 or later): an app built with an older iOS SDK runs on iOS 26 in a
+      # compatibility mode (the system's share sheet comes out oversized), and the App Store wants the new SDK
+      - name: Свежий Xcode
+        run: |
+          x="$(ls -d /Applications/Xcode_2[6-9]*.app /Applications/Xcode_[3-9][0-9]*.app 2>/dev/null | grep -v -i beta | sort -V | tail -1)"
+          if [ -n "$x" ]; then sudo xcode-select -s "$x"; else echo "::warning::Xcode 26 на машине нет, сборка на $(xcodebuild -version | head -1)"; fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Rust для iPhone
+        run: rustup target add aarch64-apple-ios
+
+      - name: Кэш Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            src-tauri/target
+          key: ios-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ios-
+
+      - name: Инструменты
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          command -v pod >/dev/null || brew install cocoapods
+          cargo tauri --version 2>/dev/null | grep -q "$TAURI_CLI_VERSION" || cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Версия
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/set-version.sh
+
+      - name: Mihomo для VPN-модуля iPhone
+        run: ./scripts/build-ios-core.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Ключ App Store Connect для подписи (только при отправке в TestFlight). Секреты задаёт владелец репозитория.
+      - name: Ключ Apple
+        if: ${{ inputs.testflight }}
+        env:
+          P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          [ -n "$P8" ] && [ -n "$KEY_ID" ] || { echo "Нет секретов APPLE_API_KEY_P8 / APPLE_API_KEY_ID: см. docs/IPHONE-VPN.md"; exit 1; }
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s' "$P8" > ~/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8
+          echo "APPLE_API_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8" >> "$GITHUB_ENV"
+
+      # значок ставится ПОСЛЕ создания проекта: иначе проект кладёт поверх свой стандартный значок Tauri
+      - name: Проект Xcode, значок VN Safe и VPN-модуль
+        env:
+          TEAM: ${{ inputs.testflight && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          # Team ID only when signing: an empty value is refused by Tauri, so it is not set at all then
+          [ -n "$TEAM" ] && export APPLE_DEVELOPMENT_TEAM="$TEAM"
+          cargo tauri ios init --ci
+          cargo tauri icon ui/assets/logo.png
+          python3 -m pip install --quiet --break-system-packages pyyaml
+          python3 scripts/ios-add-tunnel.py
+          xcodegen generate --spec src-tauri/gen/apple/project.yml
+
+      - name: Сборка .ipa (без подписи)
+        if: ${{ !inputs.testflight }}
+        run: cargo tauri ios build --no-sign --ci
+
+      - name: Сборка .ipa (подпись, для TestFlight)
+        if: ${{ inputs.testflight }}
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        # каждая загрузка в TestFlight должна иметь новый номер сборки: берётся номер запуска
+        run: cargo tauri ios build --export-method app-store-connect --build-number ${{ github.run_number }} --ci
+
+      - name: Собрать файл
+        run: |
+          ver="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/')"
+          ipa="$(find src-tauri/gen/apple/build -name '*.ipa' | head -1)"
+          [ -n "$ipa" ] || { echo "Файл .ipa не найден"; exit 1; }
+          mkdir -p dist && cp "$ipa" "dist/VNSafe-$ver.ipa"
+          echo "VER=$ver" >> "$GITHUB_ENV"
+
+      - name: Отправка в TestFlight
+        if: ${{ inputs.testflight }}
+        env:
+          KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: xcrun altool --upload-app -f "dist/VNSafe-$VER.ipa" -t ios --apiKey "$KEY_ID" --apiIssuer "$ISSUER"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VNSafe-${{ env.VER }}-iPhone
+          path: dist/*.ipa
+          retention-days: 14
+
+  mac:
+    if: ${{ inputs.mac }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - name: Rust для Intel-Mac
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Кэш Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            src-tauri/target
+          key: mac-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: mac-
+
+      - name: Tauri CLI
+        run: cargo tauri --version 2>/dev/null | grep -q "$TAURI_CLI_VERSION" || cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core-lib/go.mod
+          cache-dependency-path: core-lib/go.sum
+
+      - name: Версия, иконки, ядра
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/set-version.sh
+          cargo tauri icon src-tauri/icons/source-desktop.png
+          MAC_ARCH=x86_64 ./scripts/fetch-cores-mac.sh
+          GOARCH=amd64 ./scripts/build-core-lib.sh src-tauri/cores-mac
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Сборка
+        run: cargo tauri build --target x86_64-apple-darwin --bundles app,dmg
+
+      - name: Собрать файл
+        run: |
+          ver="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/')"
+          dmg="$(find src-tauri/target/x86_64-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)"
+          [ -n "$dmg" ] || { echo "Файл .dmg не найден"; exit 1; }
+          mkdir -p dist && cp "$dmg" "dist/VNSafe-$ver-mac.dmg"
+          echo "VER=$ver" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VNSafe-${{ env.VER }}-Mac
+          path: dist/*.dmg
+          retention-days: 14

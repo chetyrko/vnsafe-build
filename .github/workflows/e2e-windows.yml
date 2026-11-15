@@ -1,0 +1,62 @@
+# Проверка подключения на настоящей Windows (машина GitHub, права администратора, «Весь трафик» работает):
+# приложение своим кодом подключается с тестовой подпиской в обоих режимах (системный прокси и «Весь трафик»)
+# по 3 раза подряд и проверяет: сайты через VPN, российские сайты напрямую, каждый сервер, скорость,
+# отключение (порты свободны, интернет компьютера вернулся) и новое подключение сразу после.
+# Нужен секрет VN_TEST_SUB — ссылка на ТЕСТОВУЮ подписку (отдельный пользователь панели, не личная).
+# Адреса серверов в журнал не попадают (журналы открытого репозитория видны всем).
+name: Проверка подключения (Windows)
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - name: Кэш Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            src-tauri/target
+            src-tauri/cores-cache
+          key: e2e-win-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: e2e-win-
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: core-lib/go.mod
+          cache-dependency-path: core-lib/go.sum
+
+      - name: Ядра и встроенная библиотека
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/fetch-cores.ps1 -Arch x64
+          ./scripts/build-core-lib.ps1
+          if (-not (Test-Path src-tauri/cores/vncore.dll)) { throw 'vncore.dll не собралась' }
+
+      - name: Подключение как у человека
+        env:
+          VN_E2E: "1"
+          VN_E2E_MODES: proxy,tun
+          VN_SUB_URL: ${{ secrets.VN_TEST_SUB }}
+        run: |
+          if (-not $env:VN_SUB_URL) { throw 'Нет секрета VN_TEST_SUB (ссылка на тестовую подписку)' }
+          $env:VN_CORELIB_DIR = (Resolve-Path src-tauri/cores).Path
+          cd src-tauri
+          # the engine's own log lines carry server names and addresses: they stay out of the public log
+          cargo test --lib e2e -- --nocapture --test-threads=1 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^time=' }
+          exit $LASTEXITCODE

@@ -1,0 +1,131 @@
+# Выпуск версии: собирает выбранные системы и выкладывает файлы в Releases (v<версия из version.txt>).
+# Повторный запуск той же версии заменяет её файлы. «Только описание» обновляет текст без сборки.
+name: Выпуск версии
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: "Windows"
+        type: boolean
+        default: true
+      android:
+        description: "Android"
+        type: boolean
+        default: true
+      mac:
+        description: "Mac"
+        type: boolean
+        default: true
+      iphone:
+        description: "iPhone"
+        type: boolean
+        default: true
+      linux:
+        description: "Linux"
+        type: boolean
+        default: true
+      notes_only:
+        description: "Только описание (без сборки)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  # the connection checked on a real Windows first: a release is published only when it works
+  e2e:
+    if: ${{ !inputs.notes_only }}
+    uses: ./.github/workflows/e2e-windows.yml
+    secrets: inherit
+
+  windows-android:
+    if: ${{ !inputs.notes_only && (inputs.windows || inputs.android) }}
+    uses: ./.github/workflows/windows-android.yml
+    with:
+      windows: ${{ inputs.windows }}
+      android: ${{ inputs.android }}
+    secrets: inherit
+
+  apple:
+    if: ${{ !inputs.notes_only && (inputs.mac || inputs.iphone) }}
+    uses: ./.github/workflows/apple.yml
+    with:
+      ios: ${{ inputs.iphone }}
+      mac: ${{ inputs.mac }}
+      testflight: false
+    secrets: inherit
+
+  linux:
+    if: ${{ !inputs.notes_only && inputs.linux }}
+    uses: ./.github/workflows/linux.yml
+    secrets: inherit
+
+  publish:
+    needs: [e2e, windows-android, apple, linux]
+    # the page is made from whatever was built, even if one of the systems failed; never without a working connection
+    if: ${{ always() && (inputs.notes_only || needs.e2e.result == 'success' && (needs.windows-android.result == 'success' || needs.apple.result == 'success' || needs.linux.result == 'success')) }}
+    runs-on: ubuntu-latest
+    steps:
+      # the code lives in the private repository chetyrko/apps-vn; this public one only runs the builds
+      - uses: actions/checkout@v4
+        with:
+          repository: chetyrko/apps-vn
+          token: ${{ secrets.SRC_TOKEN }}
+          persist-credentials: false
+
+      - name: Версия
+        run: |
+          ver="$(sed 's/^\xEF\xBB\xBF//' version.txt | tr -d '\r' | grep -v '^[[:space:]]*#' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+          [ -n "$ver" ] || { echo "Не найден номер версии в version.txt"; exit 1; }
+          echo "VER=$ver" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.notes_only }}
+        with:
+          pattern: VNSafe-*
+          path: got
+          merge-multiple: true
+
+      - name: Файлы
+        if: ${{ !inputs.notes_only }}
+        run: |
+          mkdir -p out
+          pick() { f="$(find got -name "$1" | head -1)"; [ -n "$f" ] && cp "$f" "out/$2" && echo "$2 ← $(basename "$f")"; true; }
+          pick 'VNSafe-Setup-*.exe' VNSafe-Setup.exe
+          pick 'VNSafe-*.apk'       VNSafe.apk
+          pick 'VNSafe-*.aab'       VNSafe.aab
+          pick 'VNSafe-*-mac.dmg'   VNSafe-mac.dmg
+          pick 'VNSafe-*.ipa'       VNSafe.ipa
+          pick 'VNSafe-*-linux.deb' VNSafe-linux.deb
+          pick 'VNSafe-*-linux.AppImage' VNSafe-linux.AppImage
+          [ -n "$(ls out)" ] || { echo "Нет ни одного файла"; exit 1; }
+          # checksums for the panel's x-vnsafe-version-sha256-<system> headers: a file next to the others
+          (cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      # the page shows only the version and, briefly, what is new (the first 8 items of ui/changelog.txt)
+      - name: Описание
+        run: |
+          {
+            echo "**Что нового**"
+            sed 's/^\xEF\xBB\xBF//' ui/changelog.txt | tr -d '\r' | awk -v v="$VER" '
+              /^## / { on = (index($0, "## " v) == 1); next }
+              on && /^- / { print }' | head -8
+          } > notes.md
+          cat notes.md
+
+      # the version's tag points at this build's commit (a re-run moves it there too)
+      - name: Метка версии
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PATCH "repos/${{ github.repository }}/git/refs/tags/v$VER" -f sha="${{ github.sha }}" -F force=true >/dev/null 2>&1 || true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VER }}
+          name: VN Safe ${{ env.VER }}
+          body_path: notes.md
+          files: ${{ !inputs.notes_only && 'out/*' || '' }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
